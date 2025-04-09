@@ -1,0 +1,240 @@
+#include <Arduino.h>
+#if defined(ESP32)
+  #include <WiFi.h>
+#elif defined(ESP8266)
+  #include <ESP8266WiFi.h>
+#endif
+#include <Firebase_ESP_Client.h>
+#include <Adafruit_MCP2515.h>
+#include "addons/TokenHelper.h"
+#include "addons/RTDBHelper.h"
+#include <NTPClient.h>
+#include <WiFiUdp.h>
+
+// =========================
+// Config Zone
+// =========================
+#define WIFI_SSID "username"
+#define WIFI_PASSWORD "xxxxxx"
+#define API_KEY "AIzaSyADyNHyBZFgvMlsdfdBw5feHYbzTzMufTJHt_U"
+#define DATABASE_URL "https://h-data-de9-default-rtdb.asia-southeast1.firebasedatabase.app/"
+#define CAN_BAUDRATE (500000)
+#define MAX_RETRY 3
+
+// =========================
+// Global Variables
+// =========================
+Adafruit_MCP2515 mcp(5, 23, 19, 18);
+
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, "pool.ntp.org", 0, 60000);
+
+unsigned long lastSendMillis = 0;
+const unsigned long dataSendInterval = 150000; // 2.5 นาที
+
+unsigned long lastPacketPrintMillis = 0;
+unsigned long lastSensorPrintMillis = 0;
+const unsigned long printInterval = 5000; // 5 วินาที
+
+
+float hydrogenPercent = 0.0;
+int temperature = 0;
+bool signupOK = false;
+
+// Retry Variables
+unsigned long lastRetryMillis = 0;
+unsigned long retryInterval = 1000;
+int retryCount = 0;
+bool retryInProgress = false;
+String retryPath;
+FirebaseJson retryJson;
+
+// =========================
+// Functions
+// =========================
+
+String getFormattedTimestamp() {
+  time_t rawTime = timeClient.getEpochTime();
+  struct tm *timeInfo = localtime(&rawTime);
+
+  char buffer[30];
+  sprintf(buffer, "%02d-%02d-%04d-%02d:%02d:%02d", 
+          timeInfo->tm_mday, 
+          timeInfo->tm_mon + 1, 
+          timeInfo->tm_year + 1900, 
+          timeInfo->tm_hour + 7, 
+          timeInfo->tm_min, 
+          timeInfo->tm_sec);
+  
+  return String(buffer);
+}
+
+void startRetry(String path, FirebaseJson &json) {
+  retryPath = path;
+  retryJson = json;
+  retryCount = 0;
+  retryInterval = 1000;
+  lastRetryMillis = millis() - retryInterval; // ส่งทันที
+  retryInProgress = true;
+}
+
+void handleRetry() {
+  if (!retryInProgress) return;
+
+  if (millis() - lastRetryMillis >= retryInterval) {
+    lastRetryMillis = millis();
+    Serial.println("[Retry] Sending data...");
+
+    if (Firebase.RTDB.setJSON(&fbdo, retryPath.c_str(), &retryJson)) {
+      Serial.println("Data sent successfully (after retry).");
+      retryInProgress = false;
+    } else {
+      Serial.println("Retry failed.");
+      retryCount++;
+      retryInterval *= 2; // 1s -> 2s -> 4s
+
+      if (retryCount >= MAX_RETRY) {
+        Serial.println("Max retries reached. Giving up.");
+        retryInProgress = false;
+      }
+    }
+  }
+}
+
+void sendSensorData() {
+  String timestamp = getFormattedTimestamp();
+  String path = "/SensorData/" + timestamp;
+
+  FirebaseJson json;
+  json.set("hydrogenPercent", hydrogenPercent);
+  json.set("temperature", temperature);
+  json.set("timestamp", timestamp);
+
+  if (!Firebase.RTDB.setJSON(&fbdo, path.c_str(), &json)) {
+    startRetry(path, json); // ถ้า Error เริ่ม Retry
+  } else {
+    Serial.println("Data sent to Firebase (timestamp) successfully.");
+  }
+
+  // ส่ง real-time
+  String realtimePath = "/Sensorrealtime";
+  if (!Firebase.RTDB.setJSON(&fbdo, realtimePath.c_str(), &json)) {
+    startRetry(realtimePath, json);
+  } else {
+    Serial.println("Data sent to Firebase (realtime) successfully.");
+  }
+}
+
+// =========================
+// Setup & Loop
+// =========================
+
+void setup() {
+  Serial.begin(115200);
+
+  Serial.println("Initializing MCP2515...");
+  if (!mcp.begin(CAN_BAUDRATE)) {
+    Serial.println("Error initializing MCP2515.");
+    while (1) delay(10);
+  }
+  Serial.println("MCP2515 initialized.");
+
+  Serial.println("Connecting to Wi-Fi...");
+  WiFi.setAutoReconnect(true);
+  WiFi.persistent(true);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(300);
+    Serial.print(".");
+  }
+  Serial.println("\nWi-Fi connected.");
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP());
+
+  timeClient.begin();
+  timeClient.update();
+
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+  config.timeout.serverResponse = 10000;
+  config.token_status_callback = tokenStatusCallback;
+
+  if (Firebase.signUp(&config, &auth, "", "")) {
+    Serial.println("Firebase authentication successful.");
+    signupOK = true;
+  } else {
+    Serial.print("[Firebase] Sign-up error: ");
+    Serial.println(config.signer.signupError.message.c_str());
+  }
+
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+}
+
+void loop() {
+  timeClient.update();
+  handleRetry(); // เช็กและ retry firebase ตลอด
+
+  int packetSize = mcp.parsePacket();
+  if (packetSize) {
+
+    // Serial.print("Received CAN packet: 0x");
+    // Serial.print(mcp.packetId(), HEX);
+    // Serial.print(" Length: ");
+    // Serial.println(packetSize);
+    if (millis() - lastPacketPrintMillis > printInterval) {
+      lastPacketPrintMillis = millis();
+
+      Serial.print("Received CAN packet: 0x");
+      Serial.print(mcp.packetId(), HEX);
+      Serial.print(" Length: ");
+      Serial.println(packetSize);
+    }
+
+    if (mcp.packetId() == 0x256) {
+      uint8_t rxBuf[8];
+      int i = 0;
+      while (mcp.available()) {
+        rxBuf[i++] = mcp.read();
+      }
+      
+      uint16_t hydrogenRaw = (rxBuf[1] << 8) | rxBuf[2];
+      hydrogenPercent = hydrogenRaw * 0.01;
+      uint8_t temperatureRaw = rxBuf[0];
+      temperature = temperatureRaw - 55;
+
+      // Serial.print("Hydrogen: ");
+      // Serial.print(hydrogenPercent, 2);
+      // Serial.println("%");
+
+      // Serial.print("Temperature: ");
+      // Serial.print(temperature);
+      // Serial.println("°C");
+
+      if (millis() - lastSensorPrintMillis > printInterval) {
+        lastSensorPrintMillis = millis();
+
+        Serial.print("Hydrogen: ");
+        Serial.print(hydrogenPercent, 2);
+        Serial.println("%");
+
+        Serial.print("Temperature: ");
+        Serial.print(temperature);
+        Serial.println("°C");
+      }
+
+    } else {
+      Serial.println("Unknown CAN ID received.");
+    }
+  }
+
+  if (Firebase.ready() && signupOK && (millis() - lastSendMillis > dataSendInterval)) {
+    lastSendMillis = millis();
+    sendSensorData();
+  }
+}
