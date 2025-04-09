@@ -1,0 +1,83 @@
+#include <Adafruit_MCP2515.h>
+
+// กำหนดขา CS และ SPI สำหรับโมดูล
+#ifdef ESP8266
+   #define CS_PIN    2
+#elif defined(ESP32)
+   #define CS_PIN    5
+#endif
+
+// กำหนด Baud Rate ของ CAN Bus (ในที่นี้ใช้ 500kbps)
+#define CAN_BAUDRATE (500000)
+
+// สร้างอ็อบเจ็กต์ MCP2515 พร้อมระบุขา CS, MOSI, MISO, และ SCK
+Adafruit_MCP2515 mcp(5, 23, 19, 18);
+
+void setup() {
+  Serial.begin(115200); // เริ่มต้น Serial Monitor ด้วย Baud Rate 115200
+  while (!Serial) delay(10); // รอให้ Serial พร้อม
+
+  Serial.println("MCP2515 Receiver Test for Hydrogen Percent!");
+
+  // เริ่มต้นการทำงานของ MCP2515 ด้วย Baud Rate 500kbps
+  if (!mcp.begin(CAN_BAUDRATE)) {
+    Serial.println("Error initializing MCP2515."); // แจ้งข้อผิดพลาดถ้าเริ่มต้น MCP2515 ไม่สำเร็จ
+    while (1) delay(10); // วนลูปไม่สิ้นสุดหากเกิดข้อผิดพลาด
+  }
+  Serial.println("MCP2515 chip found"); // แจ้งว่า MCP2515 ทำงานได้ปกติ
+}
+
+void loop() {
+  // ตรวจสอบว่ามีข้อมูลใน CAN Bus หรือไม่
+  int packetSize = mcp.parsePacket(); // อ่านข้อมูล CAN Frame
+
+  if (packetSize) { // ถ้ามีข้อมูลใน CAN Bus
+    // แสดง ID และความยาวของ CAN Frame
+    Serial.print("Received packet with ID: 0x");
+    Serial.print(mcp.packetId(), HEX); // แสดง CAN ID
+    Serial.print(" Length: ");
+    Serial.println(packetSize); // แสดงความยาวของแพ็กเกจ
+
+    // ตรวจสอบว่า ID ของแพ็กเกจคือ 0x256 หรือไม่
+    if (mcp.packetId() == 0x256) { // CAN ID ที่กำหนดในตาราง
+      uint8_t rxBuf[10]; // สร้าง buffer สำหรับเก็บข้อมูล CAN Frame (8 ไบต์)
+      int i = 0;
+
+      // อ่านข้อมูลจาก CAN Frame ทีละไบต์
+      while (mcp.available()) {
+        rxBuf[i] = mcp.read(); // เก็บข้อมูลแต่ละไบต์ใน buffer
+        // Serial.printf("rxBuf[%d]: %d\n", i, rxBuf[i]);
+        i++;
+      }
+
+      // อ่านค่าดิบ Hydrogen Percent จากตำแหน่ง Byte 1 และ Byte 2
+      uint16_t hydrogenRaw = (rxBuf[1] << 8) | rxBuf[2]; // รวม Byte 1 และ Byte 2 (Big Endian)
+      // Serial.print(hydrogenRaw);
+      // Serial.println();
+      float hydrogen = hydrogenRaw * 0.01; // คูณด้วย Factor 0.01 เพื่อแปลงเป็นเปอร์เซ็นต์
+
+      // แสดงผล Hydrogen Percent
+      Serial.print("Hydrogen Percent: ");
+      Serial.print(hydrogen, 2); // แสดงผล Hydrogen พร้อมทศนิยม 2 ตำแหน่ง
+      Serial.println(" %");
+
+      // อ่านค่าดิบ Temperature จาก Byte 0
+      uint8_t temperatureRaw = rxBuf[0]; // ค่า Temperature อยู่ที่ Byte 0
+      int temperature = temperatureRaw - 55; // ใช้ Offset -55 เพื่อคำนวณค่า Temperature จริง
+
+      // แสดงผล Temperature
+      Serial.print("Temperature: ");
+      Serial.print(temperature); // แสดงค่า Temperature
+      Serial.println(" °C");
+
+      // Additional debugging output
+      Serial.printf("Raw Hydrogen Data: 0x%04X (%d)\n", hydrogenRaw, hydrogenRaw);
+    } else { // หาก ID ของ CAN Frame ไม่ตรงกับ 0x256
+      Serial.println("Unknown ID received."); // แสดงข้อความแจ้งว่า ID ไม่ตรง
+    }
+
+    Serial.println(); // เพิ่มบรรทัดว่างเพื่อความชัดเจน
+  }
+
+  delay(2000); // รอ 2 วินาทีเพื่อหลีกเลี่ยงการอ่านซ้ำบ่อยเกินไป
+}
